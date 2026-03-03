@@ -1,0 +1,53 @@
+-- Full query: Daily replication cost per object in a replication group
+WITH group_usage AS (
+SELECT
+replication_group_name,
+DATE_TRUNC('DAY', start_time) AS day,
+SUM(storage_bytes)/1024/1024/1024 AS group_storage_gb,
+SUM(storage_bytes)/1024/1024/1024 * 0.23 AS group_storage_cost_usd -- replace 0.23 with your cost per GB
+FROM snowflake.account_usage.replication_group_usage_history
+WHERE replication_group_name = 'MY_REPLICATION_GROUP' -- Replace with your group
+AND start_time >= DATEADD(DAY, -30, CURRENT_DATE()) -- last 30 days
+GROUP BY replication_group_name, DATE_TRUNC('DAY', start_time)
+),
+
+-- Get database names included in this replication group
+replicated_databases AS (
+SELECT database_name
+FROM snowflake.account_usage.replication_databases
+WHERE replication_group_name = 'MY_REPLICATION_GROUP'
+),
+
+-- Get object sizes: tables (can add stages similarly)
+object_sizes AS (
+SELECT
+t.table_catalog || '.' || t.table_schema || '.' || t.table_name AS object_name,
+t.table_catalog AS database_name,
+t.table_schema,
+t.table_name,
+t.bytes / 1024.0 / 1024.0 / 1024.0 AS size_gb -- table size in GB
+FROM snowflake.account_usage.tables t
+JOIN replicated_databases d
+ON t.table_catalog = d.database_name
+),
+
+-- Sum of object sizes per day (used to distribute replication cost proportionally)
+total_object_size AS (
+SELECT
+SUM(size_gb) AS total_size_gb
+FROM object_sizes
+)
+
+-- Final output: attribute replication group cost proportionally to objects
+SELECT
+g.replication_group_name,
+g.day,
+o.object_name,
+o.size_gb,
+g.group_storage_gb,
+g.group_storage_cost_usd,
+o.size_gb / t.total_size_gb * g.group_storage_cost_usd AS object_storage_cost_usd
+FROM group_usage g
+CROSS JOIN object_sizes o
+CROSS JOIN total_object_size t
+ORDER BY g.day, object_storage_cost_usd DESC;
